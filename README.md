@@ -52,10 +52,42 @@ contains real customer data — keep it out of version control.**
 
 See [`src/piusi_client.py`](src/piusi_client.py) for the full API.
 
+## Running as a service (MySQL logger)
+
+[`service/piusi_logger.py`](service/piusi_logger.py) polls the bowser on an
+interval and stores every record in MySQL. Each record is written to the raw
+wire log, then to a local spool file, and only then inserted into MySQL. The
+spool file is deleted once the INSERT commits, so a MySQL outage delays
+records rather than losing them.
+
+1. Create the table: paste [`service/schema.sql`](service/schema.sql) into
+   phpMyAdmin (SQL tab) or `mysql`.
+2. Install:
+   ```
+   sudo useradd --system --no-create-home piusi
+   sudo git clone https://github.com/andyharding1983/piusi-pw-wifi-protocol /opt/piusi-logger
+   sudo install -d -m 750 -o root -g piusi /etc/piusi-logger
+   sudo install -m 640 -o root -g piusi /opt/piusi-logger/service/config.example.ini /etc/piusi-logger/config.ini
+   sudo nano /etc/piusi-logger/config.ini        # bowser + MySQL details
+   sudo apt install python3-mysql.connector     # if not already present
+   ```
+3. Check MySQL without touching the bowser:
+   `sudo -u piusi python3 /opt/piusi-logger/service/piusi_logger.py --check-db`
+4. Enable:
+   ```
+   sudo cp /opt/piusi-logger/service/piusi-logger.service /etc/systemd/system/
+   sudo systemctl daemon-reload && sudo systemctl enable --now piusi-logger
+   journalctl -u piusi-logger -f
+   ```
+
+**Once running, the service takes every record off the bowser.** PIUSI's own
+software won't see them. Don't run both against the same bowser.
+
 ## Tests
 
 ```
 python3 tests/test_piusi_client.py
+python3 tests/test_piusi_logger.py
 ```
 
 All test fixtures are synthetic/hand-constructed, not from any real capture.
