@@ -34,7 +34,10 @@ hasn't collected it yet, it never will.
 ```python
 from piusi_client import PiusiClient
 
-client = PiusiClient(host="192.168.1.101", unit_address="123456")
+client = PiusiClient(host="192.168.1.101", unit_address="YOUR_UNIT_ADDRESS")
+# unit_address is YOUR device's RS485 address -- there's no shared/default
+# value, every site's dispenser has its own. See docs/PROTOCOL.md for how
+# to find it (capture traffic from the official software).
 client.connect()      # retries internally -- the bridge's TCP accept is flaky
 client.handshake()
 
