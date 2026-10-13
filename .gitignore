@@ -6,6 +6,8 @@
 *_capture_log*.txt
 captures/
 logs/
+piusi-logs/
+piusi-raw-*.jsonl
 
 # Python
 __pycache__/
