@@ -15,19 +15,19 @@ confirmed vs. still unknown.
 
 ## Status
 
-Protocol is decoded and working:
-- Connect / handshake / poll-for-records all implemented and tested.
+- Handshake, poll (`P`) and confirm (`C`) decoded from a capture of the
+  official software and implemented; tested against a protocol-accurate fake.
+  Not yet seen returning a record on the live device with this client.
 - Record format (date, time, operator, key, litres) confirmed against the
   official software's own data on a real site.
 - See [`docs/PROTOCOL.md`](docs/PROTOCOL.md#open-questions) for what's still
-  unconfirmed (DLE byte-stuffing and the 3-byte quantity field are inferred
-  and need confirming; no bulk/report-dump command found yet).
+  unconfirmed.
 
-**Read the "Destructive read — operational warning" section in
-[`docs/PROTOCOL.md`](docs/PROTOCOL.md#destructive-read--operational-warning)
-before polling against a live system.** Successfully reading a record
-appears to permanently remove it from the device — if PIUSI's own software
-hasn't collected it yet, it never will.
+**Read the "Destructive confirm — operational warning" section in
+[`docs/PROTOCOL.md`](docs/PROTOCOL.md#destructive-confirm--operational-warning)
+before polling against a live system.** Confirming a record (`C`) deletes
+it from the device — if PIUSI's own software hasn't collected it yet, it
+never will.
 
 ## Usage
 
@@ -42,15 +42,21 @@ client.connect()      # retries internally -- the bridge's TCP accept is flaky
 client.handshake()
 
 for record in client.drain_queue():
-    print(record.timestamp, record.person, record.key, record.litres)
+    save(record)   # store it durably *before* the loop continues: asking for
+                   # the next record confirms (deletes) this one on the device
 ```
+
+Or step by step: `fetch_next()` sends `P` and returns the oldest pending
+record (or `None`); `confirm(frame)` sends `C` for that record. `confirm`
+refuses anything except the record just fetched, so a `C` can't go out
+blind.
 
 Every byte sent and received is appended to a raw capture log, and fsync'd
 to disk *before* anything is parsed. The log defaults to
 `~/piusi-logs/piusi-raw-YYYY-MM-DD.jsonl`; pass `raw_log_path=` to change
-it. There is deliberately no way to turn it off: reads are destructive,
-so if a record fails to parse (or the parser is later found to be wrong)
-this log is the only copy. Replay it with `read_raw_log()`. **The log
+it. There is deliberately no way to turn it off: once a record is
+confirmed it's gone from the device, so if it was mis-parsed (or the parser
+is later found to be wrong) this log is the only copy. Replay it with `read_raw_log()`. **The log
 contains real customer data — keep it out of version control.**
 
 See [`src/piusi_client.py`](src/piusi_client.py) for the full API.
@@ -59,9 +65,11 @@ See [`src/piusi_client.py`](src/piusi_client.py) for the full API.
 
 [`service/piusi_logger.py`](service/piusi_logger.py) polls the bowser on an
 interval and stores every record in MySQL. Each record is written to the raw
-wire log, then to a local spool file, and only then inserted into MySQL. The
-spool file is deleted once the INSERT commits, so a MySQL outage delays
-records rather than losing them.
+wire log and a local spool file (both fsync'd) *before* it's confirmed with
+`C`, and inserted into MySQL from the spool. The spool file is deleted once
+the INSERT commits, so a MySQL outage delays records rather than losing
+them. If a confirm is lost and the device re-sends a record, it's
+recognised and not stored twice.
 
 1. Create the table: paste [`service/schema.sql`](service/schema.sql) into
    phpMyAdmin (SQL tab) or `mysql`.

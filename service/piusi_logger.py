@@ -4,14 +4,19 @@ piusi_logger: polls a PIUSI dispenser on an interval and stores every
 uplift record in MySQL. Meant to run as a systemd service (see
 piusi-logger.service).
 
-Reads are destructive (see docs/PROTOCOL.md), so each record passes through
-three durable stages, and each stage is on disk before the next one starts:
+Each cycle: D, then repeat P -> '+' -> store -> C until P -> '0'. The C
+(confirm) is what makes the device delete a record (see docs/PROTOCOL.md),
+so it's only sent once the record is durably stored:
 
   1. raw wire log  -- every byte, fsync'd before decoding (piusi_client.RawLog)
-  2. spool file    -- one JSON file per record, fsync'd, written as soon as
-                      the frame is received
-  3. MySQL         -- inserted from the spool; the spool file is deleted only
+  2. spool file    -- one JSON file per record, fsync'd
+  3. C             -- only now does the device delete the record
+  4. MySQL         -- inserted from the spool; the spool file is deleted only
                       after the INSERT commits
+
+If the connection drops between 2 and 3, the device sends the same record
+again next time. That resend is recognised by its bytes (which include the
+time to the second) and confirmed without being stored twice.
 
 If MySQL is unreachable, records wait in the spool and are retried on every
 cycle. Inserts are keyed on a per-record capture_id, so a retry can't
@@ -52,9 +57,8 @@ COLUMNS = [
     "raw_hex",
 ]
 
-# Late replies: how long to listen after the final (unanswered) C before
-# disconnecting. Anything arriving after close() would be lost.
-LATE_REPLY_WAIT = 3.0
+# Safety cap on records per cycle (the device queue is normally small).
+MAX_RECORDS_PER_CYCLE = 500
 
 
 def frame_to_row(frame: pc.Frame, unit_address: str) -> dict:
@@ -86,6 +90,8 @@ def frame_to_row(frame: pc.Frame, unit_address: str) -> dict:
     )
     if ts is None:
         row["parse_error"] = "date/time fields are BCD but not a valid timestamp"
+    if rec.second is None:
+        row["parse_error"] = ((row["parse_error"] or "") + " [seconds byte >= 60]").strip()
     if frame.stuffing_anomaly:
         row["parse_error"] = ((row["parse_error"] or "") + " [DLE stuffing anomaly]").strip()
     return row
@@ -127,6 +133,28 @@ class Spool:
 
     def remove(self, path: Path) -> None:
         path.unlink()
+        self._fsync_dir()
+
+    # Raw bytes of the last record stored, to recognise a resend after a C
+    # that didn't reach the device. Kept as a non-.json file so pending()
+    # ignores it.
+    @property
+    def _last_path(self) -> Path:
+        return self.dir / "last_stored.raw"
+
+    def last_stored_raw(self) -> str | None:
+        try:
+            return self._last_path.read_text().strip() or None
+        except FileNotFoundError:
+            return None
+
+    def set_last_stored_raw(self, raw_hex: str) -> None:
+        tmp = self._last_path.with_suffix(".tmp")
+        with open(tmp, "w") as fh:
+            fh.write(raw_hex)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, self._last_path)
         self._fsync_dir()
 
 
@@ -221,15 +249,15 @@ class Stopping:
 
 
 def poll_once(cfg: configparser.ConfigParser, spool: Spool, stop: Stopping) -> int:
-    """Connect, drain every queued record into the spool, disconnect."""
+    """Connect, fetch-store-confirm every pending record, disconnect."""
     b = cfg["bowser"]
     unit = b["unit_address"]
     log_dir = Path(cfg["service"].get("log_dir", "/var/lib/piusi-logger/raw"))
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
     client = pc.PiusiClient(
         host=b["host"],
-        port=b.getint("port", pc.DEFAULT_PORT),
         unit_address=unit,
+        port=b.getint("port", pc.DEFAULT_PORT),
         raw_log_path=log_dir / f"piusi-raw-{stamp}.jsonl",
     )
     got = 0
@@ -238,19 +266,25 @@ def poll_once(cfg: configparser.ConfigParser, spool: Spool, stop: Stopping) -> i
         if not client.handshake():
             log.warning("handshake not acknowledged; skipping this cycle")
             return 0
-        empty_in_a_row = 0
-        while empty_in_a_row < 2 and not stop.requested:
-            frame = client.query_next_frame()
-            if frame is None:
-                empty_in_a_row += 1
-                continue
-            empty_in_a_row = 0
-            spool.write(frame_to_row(frame, unit))
-            got += 1
-        for frame in client.collect_late_frames(LATE_REPLY_WAIT):
-            log.warning("late record collected before disconnect")
-            spool.write(frame_to_row(frame, unit))
-            got += 1
+        while got < MAX_RECORDS_PER_CYCLE and not stop.requested:
+            try:
+                frame = client.fetch_next()
+                if frame is None:
+                    break  # device says nothing pending
+                raw_hex = frame.params.hex()
+                if raw_hex == spool.last_stored_raw():
+                    log.info("device re-sent the last stored record (previous confirm was lost); confirming")
+                else:
+                    spool.write(frame_to_row(frame, unit))
+                    spool.set_last_stored_raw(raw_hex)
+                    got += 1
+                client.confirm(frame)  # only now does the device delete it
+            except pc.NoReplyError:
+                log.warning("no reply to poll; ending cycle (nothing is deleted without a C)")
+                break
+            except ConnectionError as e:
+                log.warning("connection lost (%s); ending cycle", e)
+                break
     finally:
         client.close()
     return got

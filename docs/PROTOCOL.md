@@ -79,26 +79,23 @@ no slack:
 end of params (i.e. everything after STX and before ETX). Verified against
 every frame type observed.
 
-### DLE byte-stuffing (inferred, not yet confirmed)
+### DLE byte-stuffing
 
 Because `0x10` (DLE) introduces the STX/ETX delimiters, a literal `0x10`
-inside the address/command/params is almost certainly sent doubled as
-`10 10`, in the usual DLE-framing convention. Evidence: the only `+` records
-captured so far were from October, where the month byte is BCD `0x10` —
-and they showed an unexplained duplicate `0x10` right after it
-(`06 10 10 26`). See the record format below.
+inside the address/command/params is sent doubled as `10 10`, in the usual
+DLE-framing convention. Evidence: every `+` record in the capture was from
+October, where the month byte is BCD `0x10`, and showed what was first read
+as an unexplained duplicate `0x10` (`06 10 10 26`). With stuffing removed,
+every record is exactly 32 bytes, and its checksum matches **only** when
+computed over the un-stuffed bytes.
 
 Consequences for a client:
 - A receiver must un-stuff (`10 10` → `10`) and must **not** simply search
   for the first `10 03`: e.g. October at 10:03 puts `10 10 10 10 03` inside
   the data.
 - `0x10 0x02` inside a frame means a new frame has started.
-- The checksum byte may itself be `0x10`, presumably also stuffed.
-- **Unconfirmed:** whether the checksum is computed over the stuffed or
-  un-stuffed bytes. The two differ only when an odd number of bytes were
-  stuffed. `src/piusi_client.py` doesn't enforce the checksum; it reports
-  which variant matched (`Frame.checksum_matches`), so the raw capture log
-  from a real session will settle it.
+- The checksum is the XOR of the **un-stuffed** bytes. The checksum byte may
+  itself be `0x10`, presumably also stuffed (not yet seen).
 
 The preamble/trailer `0xFF` byte counts vary slightly (3–5 preamble bytes,
 1–2 trailer bytes) between frames; they appear to be line-idle padding
@@ -112,10 +109,28 @@ between them.
 |---|---|---|---|
 | `0x44` | `D` | client → device | Session handshake. Send once immediately after connecting. Params observed: `00 06 01 00 02 06 01 04 02 04 00 04` (12 bytes, meaning unknown — possibly client capability/version flags). |
 | `0x41` | `A` | device → client | Ack to the handshake, no payload. |
-| `0x50` | `P` | client → device | Heartbeat/poll. No params. Used by the official software to keep the link alive between data polls; not required for data extraction. |
-| `0x30` | `0` | device → client | Ack to `P`, no payload. |
-| `0x43` | `C` | client → device | "Pop next record" query. No params. |
-| `0x2b` | `+` | device → client | A queued uplift record (see below). **Only sent if the device actually has a record to return** — if the backlog is empty, the device sends nothing and the request times out, rather than replying with an empty/null record. |
+| `0x50` | `P` | client → device | **Poll for the oldest pending record.** No params. |
+| `0x2b` | `+` | device → client | Reply to `P`: the oldest pending uplift record (see below). The record is **not** deleted yet. |
+| `0x30` | `0` | device → client | Reply to `P`: nothing pending. No payload. |
+| `0x43` | `C` | client → device | **Confirm** the record just received. No params, **no reply**. The device deletes that record; the next `P` returns the next one. (Possibly *conferma* or *cancella* — PIUSI is Italian.) |
+
+The official software's sequence, from the capture:
+
+```
+D → A
+P → +   (record 1)      C   (20–170 ms after the +)
+P → +   (record 2)      C   (P sent ~1.22 s after the previous C)
+...
+P → 0   (nothing left)
+P → 0   (heartbeat, every ~1.2 s while connected)
+```
+
+**An earlier version of this document had `P` and `C` the wrong way
+round** (`C` as "pop next record", `P` as an optional heartbeat). That was
+a misreading of the capture: every `+` is the reply to a `P`, and `C` is
+sent *after* it. A client built on the old reading sends `C` with no
+record pending, which gets no reply — and may delete a record nobody has
+seen (see below).
 
 Example raw bytes (address anonymized to `123456`; checksums recomputed to match
 — these are not a verbatim capture, see src/piusi_client.py for a tested
@@ -136,8 +151,9 @@ stuffing (see above):
 offset  size  field
 0       3     date, BCD: [day] [month] [year-2digits]
 3       2     time, BCD: [hour] [minute]
-5       4     unknown (seen as low, non-constant values; possibly a
-              sub-second counter or sequence id — not yet decoded)
+5       1     seconds, plain binary (NOT BCD) -- inferred: every value
+              seen is 0-59 (e.g. 0x2e = 46, which isn't valid BCD)
+6       3     unknown, all 0x00 so far
 9       10    "person" field — free text entered by the operator,
               space-padded ASCII (e.g. name, or a generic description)
 19      10    "key" field — the registered key/ID, space-padded ASCII.
@@ -163,7 +179,7 @@ decodes instead of being lost.
 
 **This is a historical backlog, not a live snapshot.** The device appears
 to hold completed-but-uncollected uplifts in a queue and hands them out
-oldest-first, one per successful `C` poll. Confirmed by capturing six
+oldest-first, one per `P`, each removed by the following `C`. Confirmed by capturing six
 records within an 8-second burst of polling whose embedded timestamps
 spanned roughly two hours — they were clearly queued, not live.
 
@@ -180,35 +196,36 @@ spanned roughly two hours — they were clearly queued, not live.
 
 ### Open questions
 
-- **DLE stuffing** (see above) is inferred, not confirmed. Confirm
-  with a capture from a month other than October: the date should then be
-  3 bytes on the wire with no duplicate. Also confirm whether the
-  checksum covers stuffed or un-stuffed bytes.
+- **Non-October months**: stuffing is consistent with everything seen, but
+  every record so far was from October. A record from another month should
+  have a 3-byte date on the wire with no duplicate.
 - **3-byte quantity**: confirm with an uplift of 100 L or more; its first
   quantity byte should be non-zero.
-- **Bytes 5–8** (between the time and the person field) are low,
-  non-constant, undecoded. Possibly a sub-second timestamp component or
-  an internal sequence/transaction ID.
+- **Seconds byte** (offset 5) is inferred from values all being 0-59.
+  Bytes 6-8 have only been seen as `00`.
+- **`P` without `C`**: expected to return the same record again (the
+  device shouldn't delete until confirmed), but not yet observed.
+- **`C` with nothing just sent** (a "blind" `C`): unknown whether the
+  device ignores it or deletes its oldest record unseen. Never do this.
+- **Date/time setting**: the official software may set the device clock
+  (e.g. periodically, or via a menu action). Not seen in the capture.
 - **No bulk/report-dump command has been observed.** Everything captured
-  so far is one record at a time via `C`. It's possible one exists and
-  simply wasn't triggered during the capture window (e.g. a "export
-  report" action in the official software) — worth capturing specifically
-  for that.
+  so far is one record at a time via `P`/`C`.
 
-## Destructive read — operational warning
+## Destructive confirm — operational warning
 
-**Successfully receiving a `+` response appears to permanently remove
-that record from the device's queue.** If the official PIUSI software
-later tries to collect the same record, it will not be there — this
-isn't a duplicate-read situation, it's "whoever reads it first gets it."
+**`C` deletes the record from the device.** If the official PIUSI software
+later tries to collect the same record, it won't be there: whoever
+confirms it first gets it.
 
 Implications for any tool built on this protocol:
-- Don't poll `C` speculatively against a live, in-use system without the
-  operator's explicit knowledge — you may be taking records their
-  official accounting software will never see.
-- Log every byte received to disk immediately (write, flush, fsync) as
-  it arrives, not after a batch — there's no way to re-request a record
-  once it's gone.
-- Don't send another `C` while an earlier one might still be answered:
-  a late reply is still a record the device has deleted. Collect late
-  bytes first, and only poll again if no record is pending.
+- Only send `C` immediately after receiving a `+`, and only once that
+  record is durably stored. Never send `C` speculatively or as a "query".
+- Log every byte received to disk immediately (write, flush, fsync) as it
+  arrives, before decoding.
+- Expect the bridge to drop connections and miss replies. A missing reply
+  to `P` is safe (nothing is deleted without `C`). A `C` that doesn't reach
+  the device means the same record comes back on the next `P` — recognise
+  it (its bytes include the time to the second) rather than storing it twice.
+- Don't run two clients against one device: the bridge serves one at a
+  time, and whichever confirms a record takes it.

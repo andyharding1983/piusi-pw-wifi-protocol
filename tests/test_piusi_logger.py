@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import piusi_client as pc  # noqa: E402
 import piusi_logger as pl  # noqa: E402
-from test_piusi_client import _build_synthetic_record, _fake_device  # noqa: E402
+from test_piusi_client import FakeBowser, R1, R2, _build_synthetic_record  # noqa: E402
 
 
 class FakeSink:
@@ -39,7 +39,7 @@ def _frame(params):
 def test_frame_to_row_decoded():
     row = pl.frame_to_row(_frame(_build_synthetic_record(month=10, litres=150.0)), "123456")
     assert set(row) == set(pl.COLUMNS)
-    assert row["uplift_at"] == "2026-10-15 09:30:00"
+    assert row["uplift_at"] == "2026-10-15 09:30:01"
     assert row["key_code"] == "TESTKEY1"
     assert row["litres"] == "150.00"
     assert row["layout"] == "dle"
@@ -69,30 +69,72 @@ def test_spool_survives_db_outage_and_retries():
         assert sorted(r["litres"] for r in sink.rows.values()) == ["1.00", "2.00", "3.00"]
 
 
-def test_poll_once_spools_records_including_late_one():
-    frame = pc.build_frame("123456", pc.CMD_RECORD, _build_synthetic_record())
-    ack = pc.build_frame("123456", pc.CMD_HANDSHAKE_ACK)
-    # The fake answers the handshake with an ack and the record together, as
-    # if the record reply were delayed past the first C's timeout.
-    port, done = _fake_device([ack, frame])
-    saved = pc.MIN_REQUEST_GAP, pl.LATE_REPLY_WAIT
-    pc.MIN_REQUEST_GAP, pl.LATE_REPLY_WAIT = 0.0, 0.2
-    try:
-        with tempfile.TemporaryDirectory() as tmp:
-            cfg = configparser.ConfigParser()
-            cfg.read_dict({
-                "bowser": {"host": "127.0.0.1", "port": str(port), "unit_address": "123456"},
-                "service": {"log_dir": f"{tmp}/raw", "spool_dir": f"{tmp}/spool"},
-            })
-            spool = pl.Spool(f"{tmp}/spool")
-            n = pl.poll_once(cfg, spool, NoStop())
-            done.set()
-            assert n == 1
-            (path,) = spool.pending()
-            assert pl.Spool.load(path)["key_code"] == "TESTKEY1"
-            assert list(Path(f"{tmp}/raw").glob("piusi-raw-*.jsonl"))
-    finally:
-        pc.MIN_REQUEST_GAP, pl.LATE_REPLY_WAIT = saved
+def _cfg(dev, tmp):
+    cfg = configparser.ConfigParser()
+    cfg.read_dict({
+        "bowser": {"host": "127.0.0.1", "port": str(dev.port), "unit_address": dev.unit},
+        "service": {"log_dir": f"{tmp}/raw", "spool_dir": f"{tmp}/spool"},
+    })
+    return cfg
+
+
+def _spooled(spool):
+    return [pl.Spool.load(p) for p in spool.pending()]
+
+
+def test_poll_once_stores_then_confirms_each_record():
+    with FakeBowser([R1, R2]) as dev, tempfile.TemporaryDirectory() as tmp:
+        spool = pl.Spool(f"{tmp}/spool")
+        assert pl.poll_once(_cfg(dev, tmp), spool, NoStop()) == 2
+        P, C, D = pc.CMD_POLL, pc.CMD_CONFIRM, pc.CMD_HANDSHAKE
+        assert dev.received == [D, P, C, P, C, P]
+        assert dev.records == []
+        assert [r["person"] for r in _spooled(spool)] == ["ONE", "TWO"]
+        assert list(Path(f"{tmp}/raw").glob("piusi-raw-*.jsonl"))
+
+
+def test_lost_confirm_resend_is_not_stored_twice():
+    # The first C never reaches the device, so it re-sends R1. That must be
+    # recognised and confirmed, not stored as a second uplift.
+    with FakeBowser([R1, R2], ignore_confirms=1) as dev, tempfile.TemporaryDirectory() as tmp:
+        spool = pl.Spool(f"{tmp}/spool")
+        assert pl.poll_once(_cfg(dev, tmp), spool, NoStop()) == 2
+        assert dev.records == []
+        assert [r["person"] for r in _spooled(spool)] == ["ONE", "TWO"]
+
+
+def test_resend_recognised_across_cycles():
+    # Connection drops after the C is sent but before the device acts on it;
+    # the next cycle gets R1 again.
+    with FakeBowser([R1], ignore_confirms=1) as dev, tempfile.TemporaryDirectory() as tmp:
+        spool = pl.Spool(f"{tmp}/spool")
+        cfg = _cfg(dev, tmp)
+        dev.records.append(R2)
+        dev.close_after = 3  # D, P, C -> then drop
+        assert pl.poll_once(cfg, spool, NoStop()) == 1
+        dev.close_after = None
+        assert pl.poll_once(cfg, spool, NoStop()) == 1  # R1 recognised, R2 stored
+        assert [r["person"] for r in _spooled(spool)] == ["ONE", "TWO"]
+        assert dev.records == []
+
+
+def test_no_reply_stores_nothing_and_deletes_nothing():
+    with FakeBowser([R1], ignore_polls=5) as dev, tempfile.TemporaryDirectory() as tmp:
+        spool = pl.Spool(f"{tmp}/spool")
+        assert pl.poll_once(_cfg(dev, tmp), spool, NoStop()) == 0
+        assert pc.CMD_CONFIRM not in dev.received
+        assert dev.records == [R1]
+        assert spool.pending() == []
+
+
+def test_undecodable_record_still_stored_and_confirmed():
+    bad = b"\xaa" * 32
+    with FakeBowser([bad]) as dev, tempfile.TemporaryDirectory() as tmp:
+        spool = pl.Spool(f"{tmp}/spool")
+        assert pl.poll_once(_cfg(dev, tmp), spool, NoStop()) == 1
+        (row,) = _spooled(spool)
+        assert row["parse_error"] and row["raw_hex"] == bad.hex()
+        assert dev.records == []
 
 
 if __name__ == "__main__":

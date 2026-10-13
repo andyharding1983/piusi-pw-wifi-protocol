@@ -4,7 +4,12 @@ Client for the PIUSI PW-WiFi / PW-LAN RS485 bridge protocol.
 Reverse-engineered, unofficial, not affiliated with PIUSI S.p.A.
 See docs/PROTOCOL.md for the full write-up of the protocol and the
 operational quirks (flaky TCP accept, required request pacing, and the
-destructive-read behaviour of the C command) that this module works around.
+P-then-C fetch/confirm cycle) that this module works around.
+
+Protocol in one line: P polls -> the device replies '+' (oldest record) or
+'0' (nothing pending); C confirms the record just received, and the device
+then deletes it. C is the destructive step, so this client only ever sends
+C via confirm(), for the record fetch_next() just returned.
 
 Usage:
     from piusi_client import PiusiClient
@@ -15,13 +20,14 @@ Usage:
     client.connect()       # retries internally, raises if it can't get in
     client.handshake()     # sends D, expects A
 
-    for record in client.drain_queue():
-        print(record)      # UpliftRecord(date=..., time=..., person=..., key=..., litres=...)
+    while (frame := client.fetch_next()) is not None:
+        store_durably(frame)          # your code -- make sure it's on disk
+        client.confirm(frame)         # sends C: the device deletes the record
 
 Every byte sent and received is appended to a raw capture log (see RawLog)
-and fsync'd *before* it is parsed. Because C is a destructive read, this log
-is the only way to recover a record if parsing fails or is later found to be
-wrong. The log contains real customer data -- keep it out of version control.
+and fsync'd *before* it is parsed, so even a record that fails to decode
+is never lost. The log contains real customer data -- keep it out of
+version control.
 """
 
 from __future__ import annotations
@@ -44,10 +50,10 @@ DLE_ETX = b"\x10\x03"
 
 CMD_HANDSHAKE = b"D"
 CMD_HANDSHAKE_ACK = b"A"
-CMD_POLL = b"P"
-CMD_POLL_ACK = b"0"
-CMD_QUERY = b"C"
-CMD_RECORD = b"+"
+CMD_POLL = b"P"          # poll for the oldest pending record
+CMD_POLL_ACK = b"0"      # reply to P: nothing pending
+CMD_RECORD = b"+"        # reply to P: a record (not yet deleted)
+CMD_CONFIRM = b"C"       # confirm the record just received; device deletes it, no reply
 
 HANDSHAKE_PARAMS = bytes.fromhex("000601000206010402040004")
 
@@ -219,8 +225,9 @@ class UpliftRecord:
     year: int  # 2-digit, as transmitted
     hour: int
     minute: int
+    second: int | None  # inferred: binary (not BCD) byte after the minute; None if >= 60
     unknown_date_byte: int | None  # only present in the legacy 33-byte layout
-    unknown_bytes: bytes  # 4 undecoded bytes between time and person
+    unknown_bytes: bytes  # the 4 bytes after the minute (byte 0 = seconds, rest undecoded)
     person: str
     key: str
     litres: float
@@ -229,7 +236,9 @@ class UpliftRecord:
     @property
     def timestamp(self) -> datetime.datetime | None:
         try:
-            return datetime.datetime(2000 + self.year, self.month, self.day, self.hour, self.minute)
+            return datetime.datetime(
+                2000 + self.year, self.month, self.day, self.hour, self.minute, self.second or 0
+            )
         except ValueError:
             return None
 
@@ -239,8 +248,9 @@ def parse_uplift_record(params: bytes) -> UpliftRecord:
     Parse the payload of a '+' response (stuffing already removed). See
     docs/PROTOCOL.md.
 
-    Expected: 32 bytes -- date [day][month][year], time [hour][minute],
-    4 unknown, person (10), key (10), quantity (3 bytes BCD, litres x100).
+    Expected: 32 bytes -- date [day][month][year], time [hour][minute] (BCD),
+    seconds (1 byte, binary -- inferred), 3 unknown, person (10), key (10),
+    quantity (3 bytes BCD, litres x100).
 
     A 33-byte payload is the layout originally documented, with an extra
     byte after the month. That byte is believed to have been a DLE-stuffed
@@ -267,6 +277,7 @@ def parse_uplift_record(params: bytes) -> UpliftRecord:
         year=_bcd(body[2:3], "year"),
         hour=_bcd(body[3:4], "hour"),
         minute=_bcd(body[4:5], "minute"),
+        second=body[5] if body[5] < 60 else None,
         unknown_date_byte=extra,
         unknown_bytes=bytes(body[5:9]),
         person=body[9:19].decode("ascii", errors="replace").rstrip(),
@@ -323,6 +334,10 @@ def read_raw_log(path: str | os.PathLike):
             yield ts, entry["dir"], bytes.fromhex(entry["hex"]), entry.get("note", "")
 
 
+class NoReplyError(ConnectionError):
+    """The device didn't answer in time. Nothing was deleted."""
+
+
 class PiusiClient:
     def __init__(
         self,
@@ -354,6 +369,7 @@ class PiusiClient:
         self._last_send_time = 0.0
         self._decoder = FrameDecoder()
         self._inbox: list[Frame] = []
+        self._unconfirmed: Frame | None = None
 
     def connect(self) -> None:
         """Retry loop -- the converter's TCP accept is flaky by design, see docs/PROTOCOL.md."""
@@ -368,6 +384,8 @@ class PiusiClient:
                 self._sock = sock
                 self._last_send_time = 0.0
                 self._decoder = FrameDecoder()  # discard any half-frame from a previous connection
+                self._inbox = []
+                self._unconfirmed = None
                 self.raw_log.write("event", note=f"connected {self.host}:{self.port}")
                 return
             except OSError as e:
@@ -380,18 +398,11 @@ class PiusiClient:
 
     def close(self) -> None:
         if self._sock is not None:
-            # Anything still in flight (e.g. a reply that arrived after its
-            # request timed out) may be a record the device has already
-            # deleted -- log it before the socket goes away.
+            # Log anything still in flight before the socket goes away.
             self._drain_late_bytes(note="late, at close")
+        if self._sock is not None:
             self._sock.close()
             self._sock = None
-            undelivered = sum(1 for f in self._inbox if f.command == CMD_RECORD)
-            if undelivered:
-                self.raw_log.write(
-                    "event",
-                    note=f"{undelivered} record frame(s) received but not returned -- recover from this log",
-                )
             self.raw_log.write("event", note="closed")
         self.raw_log.close()
 
@@ -400,19 +411,28 @@ class PiusiClient:
         if elapsed < MIN_REQUEST_GAP:
             time.sleep(MIN_REQUEST_GAP - elapsed)
 
+    def _lost_connection(self, note: str) -> None:
+        self.raw_log.write("event", note=note)
+        if self._sock is not None:
+            self._sock.close()
+            self._sock = None
+        self._unconfirmed = None  # unconfirmed record stays on the device
+
     def _recv_logged(self, timeout: float, note: str = "") -> bytes:
-        """One recv(), logged to disk before it is decoded. b'' on timeout/close."""
-        assert self._sock is not None
+        """One recv(), logged to disk before it is decoded. b'' on timeout or
+        if the connection is gone (in which case the socket is closed)."""
+        if self._sock is None:
+            return b""
         self._sock.settimeout(timeout)
         try:
             chunk = self._sock.recv(4096)
         except socket.timeout:
             return b""
         except OSError as e:
-            self.raw_log.write("event", note=f"recv failed: {e!r}")
+            self._lost_connection(f"recv failed: {e!r}")
             return b""
         if not chunk:
-            self.raw_log.write("event", note="peer closed connection")
+            self._lost_connection("peer closed connection")
             return b""
         self.raw_log.write("rx", chunk, note=note)
         self._inbox.extend(self._decoder.feed(chunk))
@@ -422,109 +442,97 @@ class PiusiClient:
         while self._recv_logged(0.05, note=note):
             pass
 
-    def _take(self, command: bytes) -> Frame | None:
+    def _take(self, *commands: bytes) -> Frame | None:
         for i, frame in enumerate(self._inbox):
-            if frame.command == command:
+            if frame.command in commands:
                 return self._inbox.pop(i)
         return None
 
-    def _send(self, command: bytes, params: bytes = b"") -> None:
+    def _send(self, command: bytes, params: bytes = b"", pace: bool = True) -> None:
         if self._sock is None:
-            raise RuntimeError("not connected -- call connect() first")
-        self._pace()
+            raise ConnectionError("not connected")
+        if pace:
+            self._pace()
         self._drain_late_bytes(note="late, before send")
-        # Stale acks would be mistaken for the reply to this request. Record
-        # frames are kept: they have already been deleted from the device.
-        self._inbox = [f for f in self._inbox if f.command == CMD_RECORD]
+        if self._sock is None:
+            raise ConnectionError("connection lost")
+        # Stale replies would be mistaken for the reply to this request.
+        self._inbox.clear()
         frame = build_frame(self.unit_address, command, params)
         self.raw_log.write("tx", frame)
-        self._sock.sendall(frame)
+        try:
+            self._sock.sendall(frame)
+        except OSError as e:
+            self._lost_connection(f"send failed: {e!r}")
+            raise ConnectionError(f"send failed: {e}") from e
         self._last_send_time = time.time()
 
-    def _await(self, command: bytes) -> Frame | None:
-        """Wait up to recv_timeout for a frame with the given command."""
+    def _await(self, *commands: bytes) -> Frame | None:
+        """Wait up to recv_timeout for a frame with one of the given commands."""
         deadline = time.time() + self.recv_timeout
         while True:
-            frame = self._take(command)
+            frame = self._take(*commands)
             if frame is not None:
                 return frame
             remaining = deadline - time.time()
             if remaining <= 0 or not self._recv_logged(remaining):
-                frame = self._take(command)
+                frame = self._take(*commands)
                 if frame is None:
-                    self.raw_log.write("event", note=f"no {command.decode('ascii', 'replace')} frame received")
+                    wanted = "/".join(c.decode("ascii", "replace") for c in commands)
+                    self.raw_log.write("event", note=f"no {wanted} reply")
                 return frame
 
     def handshake(self) -> bool:
         self._send(CMD_HANDSHAKE, HANDSHAKE_PARAMS)
         return self._await(CMD_HANDSHAKE_ACK) is not None
 
-    def poll(self) -> bool:
-        """Heartbeat -- not required for data extraction, included for completeness."""
+    def fetch_next(self) -> Frame | None:
+        """
+        Sends P. Returns the oldest pending record as an undecoded '+' Frame,
+        or None if the device replied '0' (nothing pending).
+
+        Non-destructive: the device keeps the record until confirm() is
+        called. Asking again without confirming returns the same record.
+
+        Raises NoReplyError if the device doesn't answer (the bridge is
+        flaky); any record stays safely on the device.
+        """
+        self._unconfirmed = None
         self._send(CMD_POLL)
-        return self._await(CMD_POLL_ACK) is not None
-
-    def query_next_frame(self) -> Frame | None:
-        """
-        Returns the next queued '+' frame (undecoded), or None if the queue
-        is currently empty (request timed out with no response).
-
-        A record that arrived late (after an earlier request timed out) is
-        returned first, without sending another C.
-
-        WARNING: a successful response here appears to permanently remove
-        the record from the device's queue (destructive read). See
-        docs/PROTOCOL.md.
-        """
-        if self._sock is None:
-            raise RuntimeError("not connected -- call connect() first")
-        # Pick up any late reply *before* deciding to send another C --
-        # otherwise we'd pop a second record off the device.
-        self._pace()
-        self._drain_late_bytes(note="late, before send")
-        frame = self._take(CMD_RECORD)
+        frame = self._await(CMD_RECORD, CMD_POLL_ACK)
         if frame is None:
-            self._send(CMD_QUERY)
-            frame = self._await(CMD_RECORD)
+            raise NoReplyError("no reply to P")
+        if frame.command == CMD_POLL_ACK:
+            return None
+        self._unconfirmed = frame
         return frame
 
-    def collect_late_frames(self, wait: float) -> list[Frame]:
+    def confirm(self, frame: Frame) -> None:
         """
-        Listens for `wait` seconds without sending anything, and returns any
-        '+' frames that arrive or are already pending. Call before close()
-        if the last C might still be answered.
-        """
-        if self._sock is None:
-            raise RuntimeError("not connected -- call connect() first")
-        deadline = time.time() + wait
-        while (remaining := deadline - time.time()) > 0:
-            if not self._recv_logged(remaining, note="late, collected"):
-                break
-        frames = [f for f in self._inbox if f.command == CMD_RECORD]
-        self._inbox = [f for f in self._inbox if f.command != CMD_RECORD]
-        return frames
+        Sends C for the record fetch_next() just returned. **Destructive:**
+        the device deletes the record. Only call this once the record is
+        durably stored. The device sends no reply.
 
-    def query_next_record(self) -> UpliftRecord | None:
+        Refuses (ValueError) if `frame` isn't the record just fetched, so a
+        C can never go out blind and delete a record nobody has seen.
         """
-        query_next_frame(), decoded. Same destructive-read warning applies.
-        Raises ValueError if a record can't be decoded; its raw bytes are in
-        the capture log. Use query_next_frame() to handle that yourself.
-        """
-        frame = self.query_next_frame()
-        if frame is None:
-            return None
-        return parse_uplift_record(frame.params)
+        if frame is None or frame is not self._unconfirmed:
+            raise ValueError("confirm() only accepts the record fetch_next() just returned")
+        self._unconfirmed = None
+        # The official software sends C 20-170 ms after the '+', unpaced.
+        self._send(CMD_CONFIRM, pace=False)
 
-    def drain_queue(self, max_empty_in_a_row: int = 2):
+    def drain_queue(self):
         """
-        Generator: yields UpliftRecord objects until the queue appears
-        empty (max_empty_in_a_row consecutive timeouts).
+        Generator: yields each pending UpliftRecord, oldest first, until the
+        device reports nothing pending.
+
+        Each record is confirmed (deleted from the device) only when you ask
+        for the next one -- so store it before continuing the loop. If you
+        break out early, or a record fails to decode (ValueError), the
+        current record is left on the device.
         """
-        empty_count = 0
-        while empty_count < max_empty_in_a_row:
-            record = self.query_next_record()
-            if record is None:
-                empty_count += 1
-                continue
-            empty_count = 0
+        while (frame := self.fetch_next()) is not None:
+            record = parse_uplift_record(frame.params)
             yield record
+            self.confirm(frame)

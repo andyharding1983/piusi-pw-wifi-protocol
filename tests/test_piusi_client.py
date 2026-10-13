@@ -16,6 +16,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import piusi_client as pc  # noqa: E402
 
+pc.MIN_REQUEST_GAP = 0.0  # no need for the real device's pacing against the fake
+
 
 def manual_xor_checksum(payload: bytes) -> int:
     value = 0
@@ -30,12 +32,12 @@ def test_checksum_matches_manual_xor():
 
 
 def test_build_and_parse_round_trip():
-    frame = pc.build_frame("654321", pc.CMD_QUERY)
+    frame = pc.build_frame("654321", pc.CMD_CONFIRM)
     parsed = pc.parse_frame(frame)
     assert parsed is not None
     addr, cmd, params = parsed
     assert addr == "654321"
-    assert cmd == pc.CMD_QUERY
+    assert cmd == pc.CMD_CONFIRM
     assert params == b""
 
 
@@ -55,7 +57,7 @@ def to_bcd(n):
 
 def _build_synthetic_record(
     day=15, month=3, year=26, hour=9, minute=30,
-    person="TESTOP", key="TESTKEY1", litres=12.34, legacy_extra=None,
+    person="TESTOP", key="TESTKEY1", litres=12.34, legacy_extra=None, second=1,
 ):
     """Hand-builds an unstuffed '+' payload matching the documented layout,
     independent of parse_uplift_record, so the test can catch decode bugs.
@@ -69,7 +71,7 @@ def _build_synthetic_record(
     payload = (
         date
         + bytes([to_bcd(hour), to_bcd(minute)])
-        + b"\x01\x02\x03\x04"  # unknown bytes
+        + bytes([second]) + b"\x02\x03\x04"  # seconds (binary) + 3 unknown
         + person.encode("ascii").ljust(10)
         + key.encode("ascii").ljust(10)
         + bytes([to_bcd(qty // 10000), to_bcd(qty // 100 % 100), to_bcd(qty % 100)])
@@ -90,6 +92,7 @@ def test_parse_uplift_record_synthetic():
     assert rec.layout == "dle"
     assert (rec.day, rec.month, rec.year, rec.hour, rec.minute) == (15, 3, 26, 9, 30)
     assert rec.unknown_date_byte is None
+    assert rec.second == 1
     assert rec.unknown_bytes == b"\x01\x02\x03\x04"
     assert rec.person == "TESTOP"
     assert rec.key == "TESTKEY1"
@@ -114,7 +117,15 @@ def test_timestamp_property():
     payload = _build_synthetic_record(day=15, month=3, year=26, hour=9, minute=30)
     ts = pc.parse_uplift_record(payload).timestamp
     assert ts is not None
-    assert (ts.year, ts.month, ts.day, ts.hour, ts.minute) == (2026, 3, 15, 9, 30)
+    assert (ts.year, ts.month, ts.day, ts.hour, ts.minute, ts.second) == (2026, 3, 15, 9, 30, 1)
+
+
+def test_seconds_byte_is_binary_not_bcd():
+    # 0x2e = 46 seconds; as BCD it would be invalid.
+    rec = pc.parse_uplift_record(_build_synthetic_record(second=0x2E))
+    assert rec.second == 46 and rec.timestamp.second == 46
+    rec = pc.parse_uplift_record(_build_synthetic_record(second=0x3C))  # 60: not a second
+    assert rec.second is None and rec.timestamp.second == 0
 
 
 def test_invalid_bcd_raises():
@@ -236,105 +247,246 @@ def test_raw_log_round_trip():
         ]
 
 
-def _fake_device(reply_chunks, delay=0.0):
-    """Local TCP server standing in for the bridge: answers the first
-    request with reply_chunks (sent as separate segments, after delay
-    seconds), then records anything else sent until told to stop."""
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.bind(("127.0.0.1", 0))
-    srv.listen(1)
-    done = threading.Event()
+class FakeBowser:
+    """
+    Local TCP stand-in for the device, following the real protocol:
+    D -> A;  P -> '+' (oldest record) or '0';  C -> delete oldest, no reply.
 
-    def serve():
-        conn, _ = srv.accept()
-        conn.recv(256)
-        done.wait(delay)
-        for chunk in reply_chunks:
-            conn.sendall(chunk)
-            threading.Event().wait(0.01)
-        done.wait(5)
-        conn.close()
-        srv.close()
+    Flakiness knobs: ignore_polls / ignore_confirms (silently drop the first
+    N of each), split (send each reply in two TCP segments), close_after
+    (drop the connection after N received commands).
+    """
 
-    threading.Thread(target=serve, daemon=True).start()
-    return srv.getsockname()[1], done
+    def __init__(self, records=(), unit="123456", ignore_polls=0, ignore_confirms=0,
+                 split=False, close_after=None):
+        self.records = list(records)
+        self.unit = unit
+        self.ignore_polls = ignore_polls
+        self.ignore_confirms = ignore_confirms
+        self.split = split
+        self.close_after = close_after
+        self.received = []
+        self._stop = threading.Event()
+        self._srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._srv.bind(("127.0.0.1", 0))
+        self._srv.listen(4)
+        self.port = self._srv.getsockname()[1]
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        self._srv.close()
+
+    def _reply(self, cmd):
+        if cmd == pc.CMD_HANDSHAKE:
+            return pc.build_frame(self.unit, pc.CMD_HANDSHAKE_ACK)
+        if cmd == pc.CMD_POLL:
+            if self.ignore_polls:
+                self.ignore_polls -= 1
+                return None
+            if self.records:
+                return pc.build_frame(self.unit, pc.CMD_RECORD, self.records[0])
+            return pc.build_frame(self.unit, pc.CMD_POLL_ACK)
+        if cmd == pc.CMD_CONFIRM:
+            if self.ignore_confirms:
+                self.ignore_confirms -= 1
+            elif self.records:
+                self.records.pop(0)
+        return None
+
+    def _handle_connection(self, conn):
+        dec = pc.FrameDecoder()
+        conn.settimeout(0.05)
+        while not self._stop.is_set():
+            try:
+                data = conn.recv(4096)
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            if not data:
+                return
+            for f in dec.feed(data):
+                self.received.append(f.command)
+                if self.close_after is not None and len(self.received) >= self.close_after:
+                    return
+                reply = self._reply(f.command)
+                if reply and self.split:
+                    conn.sendall(reply[:10])
+                    threading.Event().wait(0.02)
+                    conn.sendall(reply[10:])
+                elif reply:
+                    conn.sendall(reply)
+
+    def _serve(self):
+        while not self._stop.is_set():
+            try:
+                conn, _ = self._srv.accept()
+            except OSError:
+                return
+            try:
+                self._handle_connection(conn)
+            finally:
+                conn.close()
 
 
-def test_received_bytes_logged_even_when_unparseable():
-    # The destructive-read guarantee: whatever the device sends must hit
-    # the log even if our parser can't make sense of it.
-    garbage = b"\xff\xff\x10\x02not-a-valid-record"
-    port, done = _fake_device([garbage])
-    with tempfile.TemporaryDirectory() as tmp:
-        log_path = Path(tmp) / "raw.jsonl"
-        client = pc.PiusiClient("127.0.0.1", "123456", port=port, raw_log_path=log_path)
-        client.connect()
-        assert client.query_next_record() is None
-        done.set()
-        client.close()
-        rx = b"".join(b for _, d, b, _ in pc.read_raw_log(log_path) if d == "rx")
-        tx = [b for _, d, b, _ in pc.read_raw_log(log_path) if d == "tx"]
-        assert rx == garbage
-        assert tx == [pc.build_frame("123456", pc.CMD_QUERY)]
+def _client(dev, log_path, **kw):
+    kw.setdefault("recv_timeout", 0.5)
+    c = pc.PiusiClient("127.0.0.1", dev.unit, port=dev.port, raw_log_path=log_path, **kw)
+    c.connect()
+    assert c.handshake()
+    return c
 
 
-def test_undecodable_record_raises_but_is_logged():
-    bad = pc.build_frame("123456", pc.CMD_RECORD, b"\xaa" * 32)  # not BCD
-    port, done = _fake_device([bad])
-    with tempfile.TemporaryDirectory() as tmp:
-        log_path = Path(tmp) / "raw.jsonl"
-        client = pc.PiusiClient("127.0.0.1", "123456", port=port, raw_log_path=log_path)
-        client.connect()
+def _log_entries(path, direction=None):
+    return [e for e in pc.read_raw_log(path) if direction is None or e[1] == direction]
+
+
+R1 = _build_synthetic_record(person="ONE", litres=1.0, second=5)
+R2 = _build_synthetic_record(person="TWO", litres=2.0, second=6)
+
+P, C, D = pc.CMD_POLL, pc.CMD_CONFIRM, pc.CMD_HANDSHAKE
+
+
+def test_fetch_and_confirm_cycle_matches_official_sequence():
+    with FakeBowser([R1, R2]) as dev, tempfile.TemporaryDirectory() as tmp:
+        c = _client(dev, Path(tmp) / "raw.jsonl")
+        f1 = c.fetch_next()
+        assert f1.params == R1
+        c.confirm(f1)
+        f2 = c.fetch_next()
+        assert f2.params == R2
+        c.confirm(f2)
+        assert c.fetch_next() is None
+        c.close()
+        assert dev.received == [D, P, C, P, C, P]
+        assert dev.records == []
+
+
+def test_fetch_is_non_destructive_without_confirm():
+    with FakeBowser([R1, R2]) as dev, tempfile.TemporaryDirectory() as tmp:
+        c = _client(dev, Path(tmp) / "raw.jsonl")
+        assert c.fetch_next().params == R1
+        assert c.fetch_next().params == R1  # same record again
+        c.close()
+        assert C not in dev.received
+        assert dev.records == [R1, R2]
+
+
+def test_confirm_refuses_blind_or_stale():
+    with FakeBowser([R1]) as dev, tempfile.TemporaryDirectory() as tmp:
+        c = _client(dev, Path(tmp) / "raw.jsonl")
+        for bad in (None, pc.Frame("123456", b"+", R1, 0, None)):
+            try:
+                c.confirm(bad)
+                raise AssertionError("confirm accepted a record that wasn't just fetched")
+            except ValueError:
+                pass
+        old = c.fetch_next()
+        c.fetch_next()  # re-fetch: `old` is now stale
         try:
-            client.query_next_record()
-            raise AssertionError("expected ValueError")
+            c.confirm(old)
+            raise AssertionError("confirm accepted a stale frame")
         except ValueError:
             pass
-        done.set()
-        client.close()
-        rx = b"".join(b for _, d, b, _ in pc.read_raw_log(log_path) if d == "rx")
-        assert rx == bad
+        c.close()
+        assert C not in dev.received
+        assert dev.records == [R1]
 
 
-def test_late_record_is_returned_not_lost():
-    # The device answers after our recv timeout. The record must come back
-    # from the next query_next_record() -- without sending a second C,
-    # which would destructively pop a *different* record.
-    frame = pc.build_frame("123456", pc.CMD_RECORD, _build_synthetic_record())
-    port, done = _fake_device([frame], delay=0.4)
-    saved_gap = pc.MIN_REQUEST_GAP
-    pc.MIN_REQUEST_GAP = 0.5
-    try:
-        with tempfile.TemporaryDirectory() as tmp:
-            log_path = Path(tmp) / "raw.jsonl"
-            client = pc.PiusiClient("127.0.0.1", "123456", port=port, raw_log_path=log_path, recv_timeout=0.2)
-            client.connect()
-            assert client.query_next_record() is None
-            threading.Event().wait(0.4)
-            rec = client.query_next_record()
-            done.set()
-            client.close()
-            assert rec is not None and rec.key == "TESTKEY1"
-            tx = [b for _, d, b, _ in pc.read_raw_log(log_path) if d == "tx"]
-            assert tx == [pc.build_frame("123456", pc.CMD_QUERY)]
-    finally:
-        pc.MIN_REQUEST_GAP = saved_gap
+def test_empty_queue_sends_no_confirm():
+    with FakeBowser([]) as dev, tempfile.TemporaryDirectory() as tmp:
+        c = _client(dev, Path(tmp) / "raw.jsonl")
+        assert c.fetch_next() is None
+        c.close()
+        assert dev.received == [D, P]
+
+
+def test_no_reply_raises_and_deletes_nothing():
+    with FakeBowser([R1], ignore_polls=1) as dev, tempfile.TemporaryDirectory() as tmp:
+        c = _client(dev, Path(tmp) / "raw.jsonl")
+        try:
+            c.fetch_next()
+            raise AssertionError("expected NoReplyError")
+        except pc.NoReplyError:
+            pass
+        assert c.fetch_next().params == R1  # still there
+        c.close()
+        assert C not in dev.received
+
+
+def test_connection_drop_ends_cleanly():
+    # Regression: a dropped connection used to spin, logging hundreds of
+    # "peer closed connection" events.
+    with FakeBowser([R1], close_after=2) as dev, tempfile.TemporaryDirectory() as tmp:
+        log_path = Path(tmp) / "raw.jsonl"
+        c = _client(dev, log_path)
+        try:
+            c.fetch_next()
+            raise AssertionError("expected ConnectionError")
+        except ConnectionError:
+            pass
+        try:
+            c.fetch_next()
+            raise AssertionError("expected ConnectionError on a dead connection")
+        except ConnectionError:
+            pass
+        c.close()
+        notes = [e[3] for e in _log_entries(log_path, "event")]
+        assert sum("peer closed" in n or "recv failed" in n for n in notes) == 1, notes
+        assert dev.records == [R1]
 
 
 def test_split_reply_reassembled_and_logged():
-    record = _build_synthetic_record()
-    frame = pc.build_frame("123456", pc.CMD_RECORD, record)
-    port, done = _fake_device([frame[:10], frame[10:]])
-    with tempfile.TemporaryDirectory() as tmp:
+    with FakeBowser([R1], split=True) as dev, tempfile.TemporaryDirectory() as tmp:
         log_path = Path(tmp) / "raw.jsonl"
-        client = pc.PiusiClient("127.0.0.1", "123456", port=port, raw_log_path=log_path)
-        client.connect()
-        rec = client.query_next_record()
-        done.set()
-        client.close()
-        assert rec is not None and rec.key == "TESTKEY1"
-        rx = b"".join(b for _, d, b, _ in pc.read_raw_log(log_path) if d == "rx")
-        assert rx == frame
+        c = _client(dev, log_path)
+        f = c.fetch_next()
+        c.close()
+        assert f.params == R1
+        rx = b"".join(e[2] for e in _log_entries(log_path, "rx"))
+        assert pc.build_frame("123456", pc.CMD_RECORD, R1) in rx
+
+
+def test_undecodable_record_logged_and_left_on_device():
+    bad = b"\xaa" * 32  # not BCD
+    with FakeBowser([bad]) as dev, tempfile.TemporaryDirectory() as tmp:
+        log_path = Path(tmp) / "raw.jsonl"
+        c = _client(dev, log_path)
+        try:
+            list(c.drain_queue())
+            raise AssertionError("expected ValueError")
+        except ValueError:
+            pass
+        c.close()
+        assert C not in dev.received
+        assert dev.records == [bad]
+        rx = b"".join(e[2] for e in _log_entries(log_path, "rx"))
+        assert pc.build_frame("123456", pc.CMD_RECORD, bad) in rx
+
+
+def test_drain_queue_confirms_each_record_after_it_is_consumed():
+    with FakeBowser([R1, R2]) as dev, tempfile.TemporaryDirectory() as tmp:
+        c = _client(dev, Path(tmp) / "raw.jsonl")
+        seen = []
+        for rec in c.drain_queue():
+            assert dev.records[0] == rec.raw  # not yet deleted while we hold it
+            seen.append(rec.person)
+        c.close()
+        assert seen == ["ONE", "TWO"]
+        assert dev.records == []
+
+
+def test_drain_queue_break_leaves_current_record():
+    with FakeBowser([R1, R2]) as dev, tempfile.TemporaryDirectory() as tmp:
+        c = _client(dev, Path(tmp) / "raw.jsonl")
+        for rec in c.drain_queue():
+            break
+        c.close()
+        assert dev.records == [R1, R2]
 
 
 if __name__ == "__main__":
