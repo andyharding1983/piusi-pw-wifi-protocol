@@ -1,0 +1,17 @@
+# Real captured traffic / logs -- contains real customer data (names,
+# vehicle/aircraft registrations, fuel quantities, timestamps). Never commit.
+*.pcap
+*.pcapng
+*.pcapng.gz
+*_capture_log*.txt
+captures/
+logs/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# OS
+.DS_Store
