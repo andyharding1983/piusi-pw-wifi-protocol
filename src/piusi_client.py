@@ -17,18 +17,27 @@ Usage:
 
     for record in client.drain_queue():
         print(record)      # UpliftRecord(date=..., time=..., person=..., key=..., litres=...)
+
+Every byte sent and received is appended to a raw capture log (see RawLog)
+and fsync'd *before* it is parsed. Because C is a destructive read, this log
+is the only way to recover a record if parsing fails or is later found to be
+wrong. The log contains real customer data -- keep it out of version control.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import datetime
+import json
+import os
 import socket
 import time
+from pathlib import Path
 
 
 DEFAULT_PORT = 12345
 MIN_REQUEST_GAP = 1.2  # seconds -- see docs/PROTOCOL.md "Connection behaviour"
+DEFAULT_LOG_DIR = Path("~/piusi-logs").expanduser()
 
 DLE_STX = b"\x10\x02"
 DLE_ETX = b"\x10\x03"
@@ -143,6 +152,53 @@ def parse_uplift_record(params: bytes) -> UpliftRecord:
     )
 
 
+class RawLog:
+    """
+    Append-only JSON-lines log of every byte on the wire, one event per line:
+
+        {"ts": "<UTC ISO-8601>", "dir": "tx"|"rx"|"event", "hex": "...", "note": "..."}
+
+    Each line is flushed and fsync'd before write() returns, so a record is
+    on disk before anything tries to parse it. Use read_raw_log() to replay.
+    """
+
+    def __init__(self, path: str | os.PathLike):
+        self.path = Path(path).expanduser()
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._fh = open(self.path, "a", encoding="ascii")
+
+    def write(self, direction: str, data: bytes = b"", note: str = "") -> None:
+        entry = {
+            "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "dir": direction,
+            "hex": data.hex(),
+        }
+        if note:
+            entry["note"] = note
+        self._fh.write(json.dumps(entry) + "\n")
+        self._fh.flush()
+        os.fsync(self._fh.fileno())
+
+    def close(self) -> None:
+        self._fh.close()
+
+
+def default_log_path() -> Path:
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d")
+    return DEFAULT_LOG_DIR / f"piusi-raw-{stamp}.jsonl"
+
+
+def read_raw_log(path: str | os.PathLike):
+    """Yields (timestamp, direction, bytes, note) for each line of a RawLog file."""
+    with open(Path(path).expanduser(), encoding="ascii") as fh:
+        for line in fh:
+            if not line.strip():
+                continue
+            entry = json.loads(line)
+            ts = datetime.datetime.fromisoformat(entry["ts"])
+            yield ts, entry["dir"], bytes.fromhex(entry["hex"]), entry.get("note", "")
+
+
 class PiusiClient:
     def __init__(
         self,
@@ -152,6 +208,7 @@ class PiusiClient:
         connect_timeout: float = 30.0,
         per_attempt_timeout: float = 0.6,
         recv_timeout: float = 2.0,
+        raw_log_path: str | os.PathLike | None = None,
     ):
         """
         unit_address: the 6-character RS485 unit address of YOUR device.
@@ -166,6 +223,9 @@ class PiusiClient:
         self.connect_timeout = connect_timeout
         self.per_attempt_timeout = per_attempt_timeout
         self.recv_timeout = recv_timeout
+        # Not optional: there is deliberately no way to talk to the device
+        # without logging, since reads are destructive. None = default path.
+        self.raw_log = RawLog(raw_log_path if raw_log_path is not None else default_log_path())
         self._sock: socket.socket | None = None
         self._last_send_time = 0.0
 
@@ -181,6 +241,7 @@ class PiusiClient:
                 sock.settimeout(self.recv_timeout)
                 self._sock = sock
                 self._last_send_time = 0.0
+                self.raw_log.write("event", note=f"connected {self.host}:{self.port}")
                 return
             except OSError as e:
                 last_error = e
@@ -192,26 +253,59 @@ class PiusiClient:
 
     def close(self) -> None:
         if self._sock is not None:
+            # Anything still in flight (e.g. a reply that arrived after its
+            # request timed out) may be a record the device has already
+            # deleted -- log it before the socket goes away.
+            self._drain_late_bytes(note="late, at close")
             self._sock.close()
             self._sock = None
+            self.raw_log.write("event", note="closed")
+        self.raw_log.close()
 
     def _pace(self) -> None:
         elapsed = time.time() - self._last_send_time
         if elapsed < MIN_REQUEST_GAP:
             time.sleep(MIN_REQUEST_GAP - elapsed)
 
+    def _recv_logged(self, timeout: float, note: str = "") -> bytes:
+        """One recv(), logged to disk before returning. b'' on timeout."""
+        assert self._sock is not None
+        self._sock.settimeout(timeout)
+        try:
+            chunk = self._sock.recv(4096)
+        except socket.timeout:
+            return b""
+        if chunk:
+            self.raw_log.write("rx", chunk, note=note)
+        else:
+            self.raw_log.write("event", note="peer closed connection")
+        return chunk
+
+    def _drain_late_bytes(self, note: str) -> bytes:
+        data = b""
+        while chunk := self._recv_logged(0.05, note=note):
+            data += chunk
+        return data
+
     def _send_and_recv(self, command: bytes, params: bytes = b"") -> bytes | None:
         """Returns raw response bytes, or None on timeout (empty queue / dropped request)."""
         if self._sock is None:
             raise RuntimeError("not connected -- call connect() first")
         self._pace()
+        # Late replies to an earlier request get logged here instead of being
+        # mistaken for the reply to this one.
+        self._drain_late_bytes(note="late, before send")
         frame = build_frame(self.unit_address, command, params)
+        self.raw_log.write("tx", frame)
         self._sock.sendall(frame)
         self._last_send_time = time.time()
-        try:
-            return self._sock.recv(256)
-        except socket.timeout:
+        resp = self._recv_logged(self.recv_timeout)
+        if not resp:
+            self.raw_log.write("event", note=f"no reply to {command.decode('ascii', 'replace')}")
             return None
+        # A frame can be split across TCP segments; collect the rest.
+        resp += self._drain_late_bytes(note="continuation")
+        return resp
 
     def handshake(self) -> bool:
         resp = self._send_and_recv(CMD_HANDSHAKE, HANDSHAKE_PARAMS)

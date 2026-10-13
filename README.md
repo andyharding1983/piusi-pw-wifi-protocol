@@ -45,6 +45,14 @@ for record in client.drain_queue():
     print(record.timestamp, record.person, record.key, record.litres)
 ```
 
+Every byte sent and received is appended to a raw capture log, and fsync'd
+to disk *before* anything is parsed. The log defaults to
+`~/piusi-logs/piusi-raw-YYYY-MM-DD.jsonl`; pass `raw_log_path=` to change
+it. There is deliberately no way to turn it off: reads are destructive,
+so if a record fails to parse (or the parser is later found to be wrong)
+this log is the only copy. Replay it with `read_raw_log()`. **The log
+contains real customer data — keep it out of version control.**
+
 See [`src/piusi_client.py`](src/piusi_client.py) for the full API.
 
 ## Tests
