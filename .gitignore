@@ -17,3 +17,7 @@ venv/
 
 # OS
 .DS_Store
+
+# Real service config (DB password, site details). Only the example is tracked.
+service/config.ini
+config.ini

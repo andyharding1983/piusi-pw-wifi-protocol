@@ -464,18 +464,17 @@ class PiusiClient:
         self._send(CMD_POLL)
         return self._await(CMD_POLL_ACK) is not None
 
-    def query_next_record(self) -> UpliftRecord | None:
+    def query_next_frame(self) -> Frame | None:
         """
-        Returns the next queued record, or None if the queue is currently
-        empty (request timed out with no response).
+        Returns the next queued '+' frame (undecoded), or None if the queue
+        is currently empty (request timed out with no response).
 
         A record that arrived late (after an earlier request timed out) is
         returned first, without sending another C.
 
         WARNING: a successful response here appears to permanently remove
         the record from the device's queue (destructive read). See
-        docs/PROTOCOL.md. Raises ValueError if a record can't be decoded;
-        its raw bytes are in the capture log.
+        docs/PROTOCOL.md.
         """
         if self._sock is None:
             raise RuntimeError("not connected -- call connect() first")
@@ -487,6 +486,31 @@ class PiusiClient:
         if frame is None:
             self._send(CMD_QUERY)
             frame = self._await(CMD_RECORD)
+        return frame
+
+    def collect_late_frames(self, wait: float) -> list[Frame]:
+        """
+        Listens for `wait` seconds without sending anything, and returns any
+        '+' frames that arrive or are already pending. Call before close()
+        if the last C might still be answered.
+        """
+        if self._sock is None:
+            raise RuntimeError("not connected -- call connect() first")
+        deadline = time.time() + wait
+        while (remaining := deadline - time.time()) > 0:
+            if not self._recv_logged(remaining, note="late, collected"):
+                break
+        frames = [f for f in self._inbox if f.command == CMD_RECORD]
+        self._inbox = [f for f in self._inbox if f.command != CMD_RECORD]
+        return frames
+
+    def query_next_record(self) -> UpliftRecord | None:
+        """
+        query_next_frame(), decoded. Same destructive-read warning applies.
+        Raises ValueError if a record can't be decoded; its raw bytes are in
+        the capture log. Use query_next_frame() to handle that yourself.
+        """
+        frame = self.query_next_frame()
         if frame is None:
             return None
         return parse_uplift_record(frame.params)

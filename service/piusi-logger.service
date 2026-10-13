@@ -1,0 +1,30 @@
+[Unit]
+Description=PIUSI fuel dispenser record logger (PW-WiFi bridge -> MySQL)
+Documentation=https://github.com/andyharding1983/piusi-pw-wifi-protocol
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=piusi
+Group=piusi
+ExecStart=/usr/bin/python3 /opt/piusi-logger/service/piusi_logger.py --config /etc/piusi-logger/config.ini
+Restart=always
+RestartSec=10
+# A polling cycle that's mid-drain finishes its current record (~1.2s) and
+# collects late replies (~3s) before exiting; give it room.
+TimeoutStopSec=60
+KillSignal=SIGTERM
+
+# /var/lib/piusi-logger (raw wire logs + spool), created and owned by systemd.
+StateDirectory=piusi-logger
+StateDirectoryMode=0700
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/piusi-logger
+
+[Install]
+WantedBy=multi-user.target
