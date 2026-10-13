@@ -53,11 +53,20 @@ HANDSHAKE_PARAMS = bytes.fromhex("000601000206010402040004")
 
 
 def checksum(payload: bytes) -> int:
-    """XOR of every byte between STX and ETX (address + command + params)."""
+    """XOR of address + command + params, computed over the *unstuffed* bytes.
+
+    Which variant the device uses is not yet confirmed for frames that
+    contain stuffed bytes -- see Frame.checksum_matches.
+    """
     value = 0
     for b in payload:
         value ^= b
     return value
+
+
+def dle_stuff(data: bytes) -> bytes:
+    """Double every 0x10 (DLE) so it can't be mistaken for a frame delimiter."""
+    return data.replace(b"\x10", b"\x10\x10")
 
 
 def build_frame(unit_address: str, command: bytes, params: bytes = b"") -> bytes:
@@ -65,90 +74,205 @@ def build_frame(unit_address: str, command: bytes, params: bytes = b"") -> bytes
     frame = (
         b"\xff\xff\xff\xff\xff"
         + DLE_STX
-        + payload
+        + dle_stuff(payload)
         + DLE_ETX
-        + bytes([checksum(payload)])
+        + dle_stuff(bytes([checksum(payload)]))
         + b"\xff"
     )
     return frame
 
 
-def parse_frame(raw: bytes) -> tuple[str, bytes, bytes] | None:
-    """Returns (unit_address, command, params) or None if not a recognisable frame."""
-    i = 0
-    while i < len(raw) and raw[i] == 0xFF:
+@dataclasses.dataclass
+class Frame:
+    unit_address: str
+    command: bytes
+    params: bytes  # DLE stuffing already removed
+    checksum: int  # as received
+    # "unstuffed", "stuffed", "both" (identical when the number of stuffed
+    # bytes is even), or None if neither matches. Recorded rather than
+    # enforced: rejecting a frame would throw away a destructively-read record.
+    checksum_matches: str | None
+    stuffing_anomaly: bool = False  # saw 0x10 followed by an unexpected byte
+
+
+class FrameDecoder:
+    """
+    Incremental decoder for the byte stream from the bridge. Feed it chunks
+    as they arrive (a frame may be split across TCP segments, or several
+    frames may share one); it returns every complete frame found.
+
+    Inside a frame, 0x10 0x10 is a literal 0x10, 0x10 0x03 ends the frame,
+    and 0x10 0x02 aborts the current frame and starts a new one.
+    """
+
+    def __init__(self):
+        self._buf = bytearray()
+
+    def feed(self, data: bytes) -> list[Frame]:
+        self._buf += data
+        frames = []
+        while True:
+            start = self._buf.find(DLE_STX)
+            if start == -1:
+                # Keep a trailing 0x10 in case it's the first half of an STX.
+                del self._buf[: max(0, len(self._buf) - 1)]
+                return frames
+            result = self._decode_from(start + 2)
+            if result is None:
+                del self._buf[:start]  # incomplete -- wait for more bytes
+                return frames
+            frame, consumed_to = result
+            del self._buf[:consumed_to]
+            if frame is not None:
+                frames.append(frame)
+
+    def _decode_from(self, i: int):
+        """Returns (Frame or None, index after frame), or None if incomplete."""
+        buf = self._buf
+        payload = bytearray()
+        stuffed = bytearray()  # the payload exactly as it appeared on the wire
+        anomaly = False
+        while True:
+            if i >= len(buf):
+                return None
+            b = buf[i]
+            if b != 0x10:
+                payload.append(b)
+                stuffed.append(b)
+                i += 1
+                continue
+            if i + 1 >= len(buf):
+                return None
+            nxt = buf[i + 1]
+            if nxt == 0x10:
+                payload.append(0x10)
+                stuffed += b"\x10\x10"
+                i += 2
+            elif nxt == 0x03:
+                i += 2
+                break
+            elif nxt == 0x02:
+                return None, i  # restart at the new STX
+            else:
+                anomaly = True
+                payload.append(0x10)
+                stuffed.append(0x10)
+                i += 1
+
+        # Checksum byte, itself possibly stuffed.
+        if i >= len(buf):
+            return None
+        cks = buf[i]
         i += 1
-    body = raw[i:]
-    if len(body) < 2 or body[0:2] != DLE_STX:
-        return None
-    body = body[2:]
-    idx = body.find(DLE_ETX)
-    if idx == -1:
-        return None
-    payload = body[:idx]
-    if len(payload) < 7:
-        return None
-    unit_address = payload[:6].decode("ascii", errors="replace")
-    command = payload[6:7]
-    params = payload[7:]
-    return unit_address, command, params
+        if cks == 0x10:
+            if i >= len(buf):
+                return None
+            if buf[i] == 0x10:
+                i += 1
+
+        if len(payload) < 7:
+            return None, i
+        unstuffed_ok = checksum(bytes(payload)) == cks
+        stuffed_ok = checksum(bytes(stuffed)) == cks
+        matches = (
+            "both" if unstuffed_ok and stuffed_ok
+            else "unstuffed" if unstuffed_ok
+            else "stuffed" if stuffed_ok
+            else None
+        )
+        frame = Frame(
+            unit_address=bytes(payload[:6]).decode("ascii", errors="replace"),
+            command=bytes(payload[6:7]),
+            params=bytes(payload[7:]),
+            checksum=cks,
+            checksum_matches=matches,
+            stuffing_anomaly=anomaly,
+        )
+        return frame, i
 
 
-def _bcd_byte_to_int(b: int) -> int:
-    return (b >> 4) * 10 + (b & 0x0F)
+def parse_frame(raw: bytes) -> tuple[str, bytes, bytes] | None:
+    """Returns (unit_address, command, params) of the first frame in raw, or None."""
+    frames = FrameDecoder().feed(raw)
+    if not frames:
+        return None
+    f = frames[0]
+    return f.unit_address, f.command, f.params
+
+
+def _bcd(data: bytes, field: str) -> int:
+    """Decode packed BCD (two decimal digits per byte), rejecting non-decimal nibbles."""
+    value = 0
+    for b in data:
+        hi, lo = b >> 4, b & 0x0F
+        if hi > 9 or lo > 9:
+            raise ValueError(f"{field}: invalid BCD byte 0x{b:02x} in {data.hex()}")
+        value = value * 100 + hi * 10 + lo
+    return value
 
 
 @dataclasses.dataclass
 class UpliftRecord:
-    raw: bytes
+    raw: bytes  # the '+' params, DLE stuffing removed
     day: int
     month: int
     year: int  # 2-digit, as transmitted
     hour: int
     minute: int
-    unknown_date_byte: int
+    unknown_date_byte: int | None  # only present in the legacy 33-byte layout
+    unknown_bytes: bytes  # 4 undecoded bytes between time and person
     person: str
     key: str
     litres: float
+    layout: str  # "dle" (32 bytes) or "legacy" (33 bytes)
 
     @property
     def timestamp(self) -> datetime.datetime | None:
         try:
             return datetime.datetime(2000 + self.year, self.month, self.day, self.hour, self.minute)
         except ValueError:
-            return None  # one of the still-unconfirmed byte positions didn't decode cleanly
+            return None
 
 
 def parse_uplift_record(params: bytes) -> UpliftRecord:
-    """Parse the 33-byte payload of a '+' response. See docs/PROTOCOL.md."""
-    if len(params) < 32:
-        raise ValueError(f"record too short: {len(params)} bytes, expected >=32")
+    """
+    Parse the payload of a '+' response (stuffing already removed). See
+    docs/PROTOCOL.md.
 
-    day = _bcd_byte_to_int(params[0])
-    month = _bcd_byte_to_int(params[1])
-    unknown_date_byte = params[2]
-    year = _bcd_byte_to_int(params[3])
-    hour = _bcd_byte_to_int(params[4])
-    minute = _bcd_byte_to_int(params[5])
+    Expected: 32 bytes -- date [day][month][year], time [hour][minute],
+    4 unknown, person (10), key (10), quantity (3 bytes BCD, litres x100).
 
-    person = params[10:20].decode("ascii", errors="replace").rstrip()
-    key = params[20:30].decode("ascii", errors="replace").rstrip()
+    A 33-byte payload is the layout originally documented, with an extra
+    byte after the month. That byte is believed to have been a DLE-stuffed
+    month of 0x10 (October), in which case it can't appear after unstuffing.
+    It's still accepted, so that a capture disproving the theory decodes
+    rather than gets thrown away.
 
-    qty_hi, qty_lo = params[31], params[32]
-    qty_raw = _bcd_byte_to_int(qty_hi) * 100 + _bcd_byte_to_int(qty_lo)
-    litres = qty_raw / 100.0
+    Raises ValueError rather than guess. The raw bytes are already in the
+    capture log, so a record that can't be decoded is still recoverable.
+    """
+    if len(params) == 32:
+        layout, extra = "dle", None
+        body = params
+    elif len(params) == 33:
+        layout, extra = "legacy", params[2]
+        body = params[:2] + params[3:]
+    else:
+        raise ValueError(f"unexpected record length {len(params)} (expected 32): {params.hex()}")
 
     return UpliftRecord(
         raw=params,
-        day=day,
-        month=month,
-        year=year,
-        hour=hour,
-        minute=minute,
-        unknown_date_byte=unknown_date_byte,
-        person=person,
-        key=key,
-        litres=litres,
+        day=_bcd(body[0:1], "day"),
+        month=_bcd(body[1:2], "month"),
+        year=_bcd(body[2:3], "year"),
+        hour=_bcd(body[3:4], "hour"),
+        minute=_bcd(body[4:5], "minute"),
+        unknown_date_byte=extra,
+        unknown_bytes=bytes(body[5:9]),
+        person=body[9:19].decode("ascii", errors="replace").rstrip(),
+        key=body[19:29].decode("ascii", errors="replace").rstrip(),
+        litres=_bcd(body[29:32], "quantity") / 100.0,
+        layout=layout,
     )
 
 
@@ -228,6 +352,8 @@ class PiusiClient:
         self.raw_log = RawLog(raw_log_path if raw_log_path is not None else default_log_path())
         self._sock: socket.socket | None = None
         self._last_send_time = 0.0
+        self._decoder = FrameDecoder()
+        self._inbox: list[Frame] = []
 
     def connect(self) -> None:
         """Retry loop -- the converter's TCP accept is flaky by design, see docs/PROTOCOL.md."""
@@ -241,6 +367,7 @@ class PiusiClient:
                 sock.settimeout(self.recv_timeout)
                 self._sock = sock
                 self._last_send_time = 0.0
+                self._decoder = FrameDecoder()  # discard any half-frame from a previous connection
                 self.raw_log.write("event", note=f"connected {self.host}:{self.port}")
                 return
             except OSError as e:
@@ -259,6 +386,12 @@ class PiusiClient:
             self._drain_late_bytes(note="late, at close")
             self._sock.close()
             self._sock = None
+            undelivered = sum(1 for f in self._inbox if f.command == CMD_RECORD)
+            if undelivered:
+                self.raw_log.write(
+                    "event",
+                    note=f"{undelivered} record frame(s) received but not returned -- recover from this log",
+                )
             self.raw_log.write("event", note="closed")
         self.raw_log.close()
 
@@ -268,77 +401,95 @@ class PiusiClient:
             time.sleep(MIN_REQUEST_GAP - elapsed)
 
     def _recv_logged(self, timeout: float, note: str = "") -> bytes:
-        """One recv(), logged to disk before returning. b'' on timeout."""
+        """One recv(), logged to disk before it is decoded. b'' on timeout/close."""
         assert self._sock is not None
         self._sock.settimeout(timeout)
         try:
             chunk = self._sock.recv(4096)
         except socket.timeout:
             return b""
-        if chunk:
-            self.raw_log.write("rx", chunk, note=note)
-        else:
+        except OSError as e:
+            self.raw_log.write("event", note=f"recv failed: {e!r}")
+            return b""
+        if not chunk:
             self.raw_log.write("event", note="peer closed connection")
+            return b""
+        self.raw_log.write("rx", chunk, note=note)
+        self._inbox.extend(self._decoder.feed(chunk))
         return chunk
 
-    def _drain_late_bytes(self, note: str) -> bytes:
-        data = b""
-        while chunk := self._recv_logged(0.05, note=note):
-            data += chunk
-        return data
+    def _drain_late_bytes(self, note: str) -> None:
+        while self._recv_logged(0.05, note=note):
+            pass
 
-    def _send_and_recv(self, command: bytes, params: bytes = b"") -> bytes | None:
-        """Returns raw response bytes, or None on timeout (empty queue / dropped request)."""
+    def _take(self, command: bytes) -> Frame | None:
+        for i, frame in enumerate(self._inbox):
+            if frame.command == command:
+                return self._inbox.pop(i)
+        return None
+
+    def _send(self, command: bytes, params: bytes = b"") -> None:
         if self._sock is None:
             raise RuntimeError("not connected -- call connect() first")
         self._pace()
-        # Late replies to an earlier request get logged here instead of being
-        # mistaken for the reply to this one.
         self._drain_late_bytes(note="late, before send")
+        # Stale acks would be mistaken for the reply to this request. Record
+        # frames are kept: they have already been deleted from the device.
+        self._inbox = [f for f in self._inbox if f.command == CMD_RECORD]
         frame = build_frame(self.unit_address, command, params)
         self.raw_log.write("tx", frame)
         self._sock.sendall(frame)
         self._last_send_time = time.time()
-        resp = self._recv_logged(self.recv_timeout)
-        if not resp:
-            self.raw_log.write("event", note=f"no reply to {command.decode('ascii', 'replace')}")
-            return None
-        # A frame can be split across TCP segments; collect the rest.
-        resp += self._drain_late_bytes(note="continuation")
-        return resp
+
+    def _await(self, command: bytes) -> Frame | None:
+        """Wait up to recv_timeout for a frame with the given command."""
+        deadline = time.time() + self.recv_timeout
+        while True:
+            frame = self._take(command)
+            if frame is not None:
+                return frame
+            remaining = deadline - time.time()
+            if remaining <= 0 or not self._recv_logged(remaining):
+                frame = self._take(command)
+                if frame is None:
+                    self.raw_log.write("event", note=f"no {command.decode('ascii', 'replace')} frame received")
+                return frame
 
     def handshake(self) -> bool:
-        resp = self._send_and_recv(CMD_HANDSHAKE, HANDSHAKE_PARAMS)
-        if resp is None:
-            return False
-        parsed = parse_frame(resp)
-        return parsed is not None and parsed[1] == CMD_HANDSHAKE_ACK
+        self._send(CMD_HANDSHAKE, HANDSHAKE_PARAMS)
+        return self._await(CMD_HANDSHAKE_ACK) is not None
 
     def poll(self) -> bool:
         """Heartbeat -- not required for data extraction, included for completeness."""
-        resp = self._send_and_recv(CMD_POLL)
-        if resp is None:
-            return False
-        parsed = parse_frame(resp)
-        return parsed is not None and parsed[1] == CMD_POLL_ACK
+        self._send(CMD_POLL)
+        return self._await(CMD_POLL_ACK) is not None
 
     def query_next_record(self) -> UpliftRecord | None:
         """
-        Sends C. Returns the next queued record, or None if the queue is
-        currently empty (request timed out with no response).
+        Returns the next queued record, or None if the queue is currently
+        empty (request timed out with no response).
+
+        A record that arrived late (after an earlier request timed out) is
+        returned first, without sending another C.
 
         WARNING: a successful response here appears to permanently remove
         the record from the device's queue (destructive read). See
-        docs/PROTOCOL.md.
+        docs/PROTOCOL.md. Raises ValueError if a record can't be decoded;
+        its raw bytes are in the capture log.
         """
-        resp = self._send_and_recv(CMD_QUERY)
-        if resp is None:
+        if self._sock is None:
+            raise RuntimeError("not connected -- call connect() first")
+        # Pick up any late reply *before* deciding to send another C --
+        # otherwise we'd pop a second record off the device.
+        self._pace()
+        self._drain_late_bytes(note="late, before send")
+        frame = self._take(CMD_RECORD)
+        if frame is None:
+            self._send(CMD_QUERY)
+            frame = self._await(CMD_RECORD)
+        if frame is None:
             return None
-        parsed = parse_frame(resp)
-        if parsed is None or parsed[1] != CMD_RECORD:
-            return None
-        _, _, params = parsed
-        return parse_uplift_record(params)
+        return parse_uplift_record(frame.params)
 
     def drain_queue(self, max_empty_in_a_row: int = 2):
         """

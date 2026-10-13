@@ -20,8 +20,8 @@ Protocol is decoded and working:
 - Record format (date, time, operator, key, litres) confirmed against the
   official software's own data on a real site.
 - See [`docs/PROTOCOL.md`](docs/PROTOCOL.md#open-questions) for what's still
-  unconfirmed (one unexplained byte in the date field, no bulk/report-dump
-  command found yet).
+  unconfirmed (DLE byte-stuffing and the 3-byte quantity field are inferred
+  and need confirming; no bulk/report-dump command found yet).
 
 **Read the "Destructive read — operational warning" section in
 [`docs/PROTOCOL.md`](docs/PROTOCOL.md#destructive-read--operational-warning)
@@ -69,8 +69,10 @@ If you've got a PIUSI PW-WiFi setup and can capture traffic from the
 official software, particularly:
 - a transaction/report *export* action (we've only ever seen one-record-at-
   a-time polling, never a bulk dump),
-- a capture from a month other than October (to help pin down the
-  unexplained date byte),
+- a capture from a month other than October (to confirm the DLE
+  byte-stuffing explanation of the old "unexplained date byte"),
+- a record for an uplift of 100 L or more (to confirm the 3-byte
+  quantity field),
 
 ...an issue or PR with the anonymized capture would be very welcome.
 
