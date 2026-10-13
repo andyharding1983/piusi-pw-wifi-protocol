@@ -283,7 +283,7 @@ def test_undecodable_record_raises_but_is_logged():
     port, done = _fake_device([bad])
     with tempfile.TemporaryDirectory() as tmp:
         log_path = Path(tmp) / "raw.jsonl"
-        client = pc.PiusiClient("127.0.0.1", port=port, raw_log_path=log_path)
+        client = pc.PiusiClient("127.0.0.1", "123456", port=port, raw_log_path=log_path)
         client.connect()
         try:
             client.query_next_record()
@@ -307,7 +307,7 @@ def test_late_record_is_returned_not_lost():
     try:
         with tempfile.TemporaryDirectory() as tmp:
             log_path = Path(tmp) / "raw.jsonl"
-            client = pc.PiusiClient("127.0.0.1", port=port, raw_log_path=log_path, recv_timeout=0.2)
+            client = pc.PiusiClient("127.0.0.1", "123456", port=port, raw_log_path=log_path, recv_timeout=0.2)
             client.connect()
             assert client.query_next_record() is None
             threading.Event().wait(0.4)
