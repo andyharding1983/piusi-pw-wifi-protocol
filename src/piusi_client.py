@@ -9,7 +9,9 @@ destructive-read behaviour of the C command) that this module works around.
 Usage:
     from piusi_client import PiusiClient
 
-    client = PiusiClient(host="192.168.1.101", port=12345, unit_address="123456")
+    # unit_address is YOUR device's RS485 address, not a shared default --
+    # see docs/PROTOCOL.md for how to find it via a capture.
+    client = PiusiClient(host="192.168.1.101", unit_address="YOUR_UNIT_ADDRESS")
     client.connect()       # retries internally, raises if it can't get in
     client.handshake()     # sends D, expects A
 
@@ -325,13 +327,20 @@ class PiusiClient:
     def __init__(
         self,
         host: str,
+        unit_address: str,
         port: int = DEFAULT_PORT,
-        unit_address: str = "123456",
         connect_timeout: float = 30.0,
         per_attempt_timeout: float = 0.6,
         recv_timeout: float = 2.0,
         raw_log_path: str | os.PathLike | None = None,
     ):
+        """
+        unit_address: the 6-character RS485 unit address of YOUR device.
+        There is no universal default -- every site's dispenser has its own
+        address. Find yours by capturing traffic from the official software
+        (see docs/PROTOCOL.md) and reading the 6 ASCII bytes right after the
+        DLE-STX in any frame.
+        """
         self.host = host
         self.port = port
         self.unit_address = unit_address

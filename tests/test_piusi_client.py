@@ -267,7 +267,7 @@ def test_received_bytes_logged_even_when_unparseable():
     port, done = _fake_device([garbage])
     with tempfile.TemporaryDirectory() as tmp:
         log_path = Path(tmp) / "raw.jsonl"
-        client = pc.PiusiClient("127.0.0.1", port=port, raw_log_path=log_path)
+        client = pc.PiusiClient("127.0.0.1", "123456", port=port, raw_log_path=log_path)
         client.connect()
         assert client.query_next_record() is None
         done.set()
@@ -327,7 +327,7 @@ def test_split_reply_reassembled_and_logged():
     port, done = _fake_device([frame[:10], frame[10:]])
     with tempfile.TemporaryDirectory() as tmp:
         log_path = Path(tmp) / "raw.jsonl"
-        client = pc.PiusiClient("127.0.0.1", port=port, raw_log_path=log_path)
+        client = pc.PiusiClient("127.0.0.1", "123456", port=port, raw_log_path=log_path)
         client.connect()
         rec = client.query_next_record()
         done.set()
