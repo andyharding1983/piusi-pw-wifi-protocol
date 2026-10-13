@@ -76,8 +76,29 @@ no slack:
 ```
 
 **Checksum** = XOR of every byte from the start of the address through the
-end of params (i.e. everything between STX and ETX, inclusive). Verified
-against every frame type observed.
+end of params (i.e. everything after STX and before ETX). Verified against
+every frame type observed.
+
+### DLE byte-stuffing (inferred, not yet confirmed)
+
+Because `0x10` (DLE) introduces the STX/ETX delimiters, a literal `0x10`
+inside the address/command/params is almost certainly sent doubled as
+`10 10`, in the usual DLE-framing convention. Evidence: the only `+` records
+captured so far were from October, where the month byte is BCD `0x10` —
+and they showed an unexplained duplicate `0x10` right after it
+(`06 10 10 26`). See the record format below.
+
+Consequences for a client:
+- A receiver must un-stuff (`10 10` → `10`) and must **not** simply search
+  for the first `10 03`: e.g. October at 10:03 puts `10 10 10 10 03` inside
+  the data.
+- `0x10 0x02` inside a frame means a new frame has started.
+- The checksum byte may itself be `0x10`, presumably also stuffed.
+- **Unconfirmed:** whether the checksum is computed over the stuffed or
+  un-stuffed bytes. The two differ only when an odd number of bytes were
+  stuffed. `src/piusi_client.py` doesn't enforce the checksum; it reports
+  which variant matched (`Frame.checksum_matches`), so the raw capture log
+  from a real session will settle it.
 
 The preamble/trailer `0xFF` byte counts vary slightly (3–5 preamble bytes,
 1–2 trailer bytes) between frames; they appear to be line-idle padding
@@ -108,24 +129,37 @@ C:  ff ff ff ff ff 10 02 31 32 33 34 35 36 43 10 03 44 ff
 
 ## `+` response — uplift record format
 
-33 bytes between the command byte and ETX:
+32 bytes between the command byte and ETX, **after** removing DLE
+stuffing (see above):
 
 ```
 offset  size  field
-0       4     date, BCD: [day] [month] [?] [year-2digits]
-4       2     time, BCD: [hour] [minute]
-6       4     unknown (seen as low, non-constant values; possibly a
+0       3     date, BCD: [day] [month] [year-2digits]
+3       2     time, BCD: [hour] [minute]
+5       4     unknown (seen as low, non-constant values; possibly a
               sub-second counter or sequence id — not yet decoded)
-10      10    "person" field — free text entered by the operator,
+9       10    "person" field — free text entered by the operator,
               space-padded ASCII (e.g. name, or a generic description)
-20      10    "key" field — the registered key/ID, space-padded ASCII.
+19      10    "key" field — the registered key/ID, space-padded ASCII.
               At the site this was reverse-engineered on, these are UK
               civil aircraft registrations (G-xxxx format) since it's an
               aviation refuelling site — on a road-fuel site this is
               presumably a vehicle reg or fuel card ID instead.
-30      2     quantity, BCD, litres x100 (i.e. divide by 100 for litres)
-32      1     pad / unknown, usually 0x00
+29      3     quantity, BCD, litres x100 (i.e. divide by 100 for litres)
 ```
+
+This layout was originally documented as 33 bytes with a 4-byte date
+`[day] [month] [?] [year]`, a 2-byte quantity, and a trailing "pad, usually
+`0x00`" byte. Every captured record was from October (month = `0x10`), so
+the extra date byte is explained by stuffing, and the remaining offsets
+match the table above. The "pad" byte is then the **high byte of a 3-byte
+quantity**: zero for any uplift under 100 L, which every captured
+record was. The old 2-byte reading would have shown a 150.00 L uplift
+(`01 50 00`) as 50.00 L.
+
+The client still accepts a 33-byte un-stuffed record using the old layout
+(`UpliftRecord.layout == "legacy"`), so a capture that disproves this
+decodes instead of being lost.
 
 **This is a historical backlog, not a live snapshot.** The device appears
 to hold completed-but-uncollected uplifts in a queue and hands them out
@@ -138,20 +172,21 @@ spanned roughly two hours — they were clearly queued, not live.
 - **Quantity scale:** a test dispense recalled as "about 0.4L" produced a
   raw value of `0041`. `0041 / 100 = 0.41L` — confirmed.
 - **Date encoding:** a capture session run on 6 Oct 2026 produced date
-  bytes `06 10 10 26` → day=06, month=10, year=26. Day/month/year all
-  correct in that byte order.
+  bytes `06 10 10 26` on the wire → day=06, month=10 (stuffed as `10 10`),
+  year=26. Day/month/year all correct in that byte order.
 - **All six field-set values (person, key, quantity) in one capture
   session were cross-checked against the official software's own
   displayed records and matched.**
 
 ### Open questions
 
-- **Byte index 2 of the date field** (the second `0x10` in `06 10 10 26`)
-  is unexplained. It happened to equal the month byte in every record
-  captured so far (all from the same day). Need a capture from a
-  different month to tell whether it tracks the month (and if so, why
-  it's duplicated) or is an unrelated constant.
-- **Bytes 6–9** (between the time and the person field) are low,
+- **DLE stuffing** (see above) is inferred, not confirmed. Confirm
+  with a capture from a month other than October: the date should then be
+  3 bytes on the wire with no duplicate. Also confirm whether the
+  checksum covers stuffed or un-stuffed bytes.
+- **3-byte quantity**: confirm with an uplift of 100 L or more; its first
+  quantity byte should be non-zero.
+- **Bytes 5–8** (between the time and the person field) are low,
   non-constant, undecoded. Possibly a sub-second timestamp component or
   an internal sequence/transaction ID.
 - **No bulk/report-dump command has been observed.** Everything captured
@@ -174,3 +209,6 @@ Implications for any tool built on this protocol:
 - Log every byte received to disk immediately (write, flush, fsync) as
   it arrives, not after a batch — there's no way to re-request a record
   once it's gone.
+- Don't send another `C` while an earlier one might still be answered:
+  a late reply is still a record the device has deleted. Collect late
+  bytes first, and only poll again if no record is pending.
